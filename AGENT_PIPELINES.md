@@ -460,3 +460,622 @@ try {
 - Флаг `isAnalyzing` предотвращает параллельные запросы
 
 ---
+
+## 2. Ask Service Pipeline
+
+**Назначение**: Обрабатывает явные запросы пользователя через кнопку Ask. Это мультимодальный пайплайн, который комбинирует текстовый запрос пользователя со скриншотом экрана для более полного контекста.
+
+**Триггер**: Пользователь нажимает кнопку Ask или использует горячую клавишу (Cmd+Shift+K / Ctrl+Shift+K)
+
+**Где реализован**: `src/features/ask/askService.js`
+
+---
+
+### ASCII Диаграмма потока
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        ASK SERVICE PIPELINE                          │
+│                     (Multimodal: Text + Screenshot)                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+[User Action]
+     │
+     │ Presses Ask button / Cmd+Shift+K
+     │
+┌────▼─────────────────────────────────┐
+│   Show Ask Dialog                    │
+│   User enters question/request       │
+└────┬─────────────────────────────────┘
+     │
+     │ User submits prompt
+     │
+┌────▼─────────────────────────────────┐
+│   Capture Screenshot                 │
+│   captureScreenshot({                │
+│     quality: 'medium'                │
+│   })                                 │
+└────┬─────────────────────────────────┘
+     │
+     │ Screenshot (JPEG base64)
+     │
+┌────▼─────────────────────────────────┐
+│   Get Conversation History           │
+│   conversationRepository             │
+│   .getAllConversation(sessionId)     │
+└────┬─────────────────────────────────┘
+     │
+     │ Recent conversation history
+     │
+┌────▼─────────────────────────────────┐
+│   Format Conversation History        │
+│   "Speaker: Text\n..."               │
+└────┬─────────────────────────────────┘
+     │
+     │ Formatted history
+     │
+┌────▼─────────────────────────────────┐
+│   Build System Prompt                │
+│   Profile: pickle_glass_analysis     │
+│   + Conversation history injected    │
+└────┬─────────────────────────────────┘
+     │
+     │ System prompt
+     │
+┌────▼─────────────────────────────────┐
+│   Build Multimodal User Prompt       │
+│   content: [                         │
+│     { type: 'text',                  │
+│       text: "User Request: ..." },   │
+│     { type: 'image_url',             │
+│       image_url: {...} }             │
+│   ]                                  │
+└────┬─────────────────────────────────┘
+     │
+     │ messages = [system, multimodal user]
+     │
+┌────▼─────────────────────────────────┐
+│   Get Current Model Config           │
+│   modelStateService                  │
+│   .getCurrentModelInfo('llm')        │
+└────┬─────────────────────────────────┘
+     │
+     │ Model config (must support vision)
+     │
+┌────▼─────────────────────────────────┐
+│   Create Streaming LLM Instance      │
+│   createStreamingLLM(provider, {     │
+│     apiKey, model,                   │
+│     temperature: 0.7,                │
+│     maxTokens: 2048                  │
+│   })                                 │
+└────┬─────────────────────────────────┘
+     │
+     │ streamingLLM instance
+     │
+┌────▼─────────────────────────────────┐
+│   Send Multimodal Streaming Request  │
+│   streamingLLM.streamChat(messages)  │
+└────┬──────────┬──────────────────────┘
+     │          │
+     │ Success  │ Failure (vision not supported)
+     │          │
+     │     ┌────▼──────────────────────┐
+     │     │   Fallback: Text Only     │
+     │     │   Retry without image     │
+     │     └────┬──────────────────────┘
+     │          │
+     │◄─────────┘
+     │
+     │ Stream of response chunks
+     │
+┌────▼─────────────────────────────────┐
+│   Process Stream Chunks              │
+│   for await (const chunk)            │
+│     → Send to Ask window via IPC     │
+│     → Accumulate fullResponse        │
+└────┬─────────────────────────────────┘
+     │
+     │ Complete response
+     │
+┌────▼─────────────────────────────────┐
+│   Display in Ask Window              │
+│   - Show formatted markdown          │
+│   - Enable copy button               │
+│   - Allow follow-up questions        │
+└──────────────────────────────────────┘
+```
+
+---
+
+### Детальное описание этапов
+
+#### 1. Триггер (User Action)
+
+**Способы активации**:
+1. **Кнопка Ask** в UI
+2. **Горячая клавиша**:
+   - macOS: `Cmd+Shift+K`
+   - Windows/Linux: `Ctrl+Shift+K`
+3. **IPC событие**: `ask-question` из main процесса
+
+```javascript
+// В main процессе регистрация hotkey
+globalShortcut.register('CommandOrControl+Shift+K', () => {
+    askService.showAskDialog();
+});
+```
+
+---
+
+#### 2. Показ Ask Dialog
+
+```javascript
+async showAskDialog() {
+    const askWin = getWindowPool().get('ask');
+
+    if (!askWin || askWin.isDestroyed()) {
+        // Создать новое окно Ask
+        createAskWindow();
+    } else {
+        // Показать существующее окно
+        askWin.show();
+        askWin.focus();
+    }
+}
+```
+
+**UI Dialog**:
+- Модальное окно с текстовым полем
+- Placeholder: "Ask me anything..."
+- Submit кнопка или Enter для отправки
+- Опциональный чекбокс для включения/выключения скриншота
+
+---
+
+#### 3. Захват скриншота
+
+```javascript
+const screenshotResult = await captureScreenshot({
+    quality: 'medium'  // 'low' | 'medium' | 'high'
+});
+
+if (screenshotResult.success) {
+    const screenshotBase64 = screenshotResult.base64;
+    // screenshot готов для отправки
+} else {
+    console.error('Screenshot capture failed:', screenshotResult.error);
+    // Продолжить без скриншота
+}
+```
+
+**Параметры качества**:
+- **low**: 50% качество, быстрый захват, меньший размер
+- **medium**: 75% качество (по умолчанию)
+- **high**: 95% качество, медленнее, больший размер
+
+**Формат**: JPEG в base64 encoding
+
+---
+
+#### 4. Получение истории разговора
+
+```javascript
+const conversationHistoryRaw = await conversationRepository.getAllConversation(
+    this.currentSessionId
+);
+```
+
+**Данные** (пример):
+```javascript
+[
+    {
+        id: 1,
+        session_id: 'abc123',
+        speaker: 'me',
+        text: 'Can you explain binary search?',
+        timestamp: 1699123456789
+    },
+    {
+        id: 2,
+        session_id: 'abc123',
+        speaker: 'Pickle',
+        text: 'Binary search is an efficient algorithm...',
+        timestamp: 1699123460123
+    },
+    // ...
+]
+```
+
+---
+
+#### 5. Форматирование истории
+
+```javascript
+_formatConversationForPrompt(conversationHistory) {
+    if (!conversationHistory || conversationHistory.length === 0) {
+        return '';
+    }
+
+    return conversationHistory
+        .map(entry => `${entry.speaker}: ${entry.text}`)
+        .join('\n');
+}
+```
+
+**Результат**:
+```
+me: Can you explain binary search?
+Pickle: Binary search is an efficient algorithm...
+me: What's the time complexity?
+Pickle: O(log n) time complexity...
+```
+
+---
+
+#### 6. Построение System Prompt
+
+```javascript
+const systemPrompt = getSystemPrompt(
+    'pickle_glass_analysis',
+    conversationHistory,  // Инжектируется в {{CONVERSATION_HISTORY}}
+    false                 // Google search disabled for Ask
+);
+```
+
+**Включает**:
+- Полный профиль `pickle_glass_analysis`
+- 6-уровневую систему приоритетов
+- История разговора для контекста
+- Правила для мультимодальной обработки
+
+---
+
+#### 7. Построение Multimodal User Prompt
+
+```javascript
+const messages = [
+    {
+        role: 'system',
+        content: systemPrompt
+    },
+    {
+        role: 'user',
+        content: [
+            {
+                type: 'text',
+                text: `User Request: ${userPrompt.trim()}`
+            },
+            {
+                type: 'image_url',
+                image_url: {
+                    url: `data:image/jpeg;base64,${screenshotBase64}`
+                }
+            }
+        ]
+    }
+];
+```
+
+**Структура мультимодального контента**:
+1. **Текст**: Прямой запрос пользователя
+2. **Изображение**: Base64-encoded скриншот в data URL формате
+
+**Пример текстовой части**:
+```
+User Request: Help me solve this LeetCode problem
+```
+
+---
+
+#### 8. Получение конфигурации модели
+
+```javascript
+const modelInfo = await modelStateService.getCurrentModelInfo('llm');
+
+// Проверка поддержки vision
+if (!modelInfo.supportsVision) {
+    console.warn('Current model does not support vision. Will retry without image.');
+}
+```
+
+**Модели с поддержкой vision**:
+- **OpenAI**: gpt-4o, gpt-4o-mini, gpt-4-turbo
+- **Anthropic**: claude-3.5-sonnet, claude-3-opus, claude-3-sonnet
+- **Gemini**: gemini-2.5-flash, gemini-pro-vision
+
+**Без vision**:
+- Ollama локальные модели (большинство)
+- Старые версии GPT-4
+
+---
+
+#### 9. Создание Streaming LLM
+
+```javascript
+const streamingLLM = createStreamingLLM(modelInfo.provider, {
+    apiKey: modelInfo.apiKey,
+    model: modelInfo.model,
+    temperature: 0.7,
+    maxTokens: 2048,       // Больше чем у Summary (1024) для детальных ответов
+    usePortkey: modelInfo.provider === 'openai-glass',
+    portkeyVirtualKey: modelInfo.provider === 'openai-glass' ? modelInfo.apiKey : undefined
+});
+```
+
+**Параметры**:
+- **Temperature**: 0.7 (баланс точности и креативности)
+- **Max Tokens**: 2048 (позволяет детальные ответы с кодом)
+- **Portkey**: Опциональный gateway для OpenAI
+
+---
+
+#### 10. Отправка запроса с Fallback
+
+```javascript
+try {
+    // Попытка с мультимодальным вводом
+    const response = await streamingLLM.streamChat(messages);
+
+    for await (const chunk of response) {
+        this.#sendAskChunk(chunk);
+        fullResponse += chunk;
+    }
+} catch (error) {
+    if (error.message.includes('vision') || error.message.includes('image')) {
+        console.log('Vision not supported, retrying without image...');
+
+        // Fallback: только текст
+        const textOnlyMessages = [
+            messages[0],  // System prompt
+            {
+                role: 'user',
+                content: `User Request: ${userPrompt.trim()}`  // Только текст
+            }
+        ];
+
+        const response = await streamingLLM.streamChat(textOnlyMessages);
+
+        for await (const chunk of response) {
+            this.#sendAskChunk(chunk);
+            fullResponse += chunk;
+        }
+    } else {
+        throw error;  // Другая ошибка
+    }
+}
+```
+
+**Логика Fallback**:
+1. Сначала попытка с изображением
+2. Если ошибка связана с vision → retry без изображения
+3. Если другая ошибка → пробросить наверх
+
+---
+
+#### 11. Обработка stream chunks
+
+```javascript
+#sendAskChunk(chunk) {
+    const askWin = getWindowPool().get('ask');
+
+    if (askWin && !askWin.isDestroyed()) {
+        askWin.webContents.send('ask-response-chunk', {
+            chunk: chunk,
+            sessionId: this.currentSessionId
+        });
+    }
+}
+```
+
+**IPC Events**:
+- `ask-response-chunk`: Частичный ответ (streaming)
+- `ask-response-complete`: Полный ответ готов
+- `ask-response-error`: Ошибка во время обработки
+
+---
+
+#### 12. Отображение в Ask Window
+
+**UI компоненты**:
+```javascript
+// В Ask window renderer
+ipcRenderer.on('ask-response-chunk', (event, data) => {
+    // Append chunk to display
+    responseDiv.innerHTML += marked.parse(data.chunk);  // Markdown рендеринг
+
+    // Auto-scroll to bottom
+    responseDiv.scrollTop = responseDiv.scrollHeight;
+});
+
+ipcRenderer.on('ask-response-complete', (event, data) => {
+    // Показать кнопки действий
+    showActionButtons();  // Copy, Ask follow-up, Close
+});
+```
+
+**Функции UI**:
+- **Markdown рендеринг**: Использует `marked.js` для форматирования
+- **Syntax highlighting**: Code blocks с подсветкой
+- **Copy button**: Копирование ответа в clipboard
+- **Follow-up**: Возможность задать новый вопрос
+- **History**: Сохранение истории Ask запросов
+
+---
+
+### Пример полного flow
+
+**Scenario**: Пользователь видит LeetCode задачу на экране
+
+**Input**:
+```
+User Prompt: "Help me solve this problem"
+
+Screenshot: [Image showing Two Sum LeetCode problem]
+
+Conversation History:
+me: I'm preparing for coding interviews
+Pickle: Great! Focus on data structures and algorithms...
+```
+
+**System Prompt** (упрощенно):
+```
+You are Pickle, the user's live-meeting co-pilot.
+
+[6-level priority system...]
+
+Conversation History:
+me: I'm preparing for coding interviews
+Pickle: Great! Focus on data structures and algorithms...
+```
+
+**User Message** (multimodal):
+```json
+{
+    "role": "user",
+    "content": [
+        {
+            "type": "text",
+            "text": "User Request: Help me solve this problem"
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+            }
+        }
+    ]
+}
+```
+
+**AI Processing**:
+1. Sees conversation context (interview prep)
+2. Reads user request
+3. Analyzes screenshot (Two Sum problem)
+4. Applies QUESTION_ANSWERING_PRIORITY (highest priority)
+
+**Output**:
+```markdown
+**Two Sum - Hash Map Solution**
+
+Here's the optimal O(n) solution using a hash map:
+
+​```python
+def twoSum(nums: List[int], target: int) -> List[int]:
+    # Hash map to store {value: index}
+    seen = {}
+
+    for i, num in enumerate(nums):
+        complement = target - num
+
+        # Check if complement exists
+        if complement in seen:
+            return [seen[complement], i]
+
+        # Store current number
+        seen[num] = i
+
+    return []  # No solution found
+​```
+
+**Complexity Analysis**
+- **Time**: O(n) - single pass through array
+- **Space**: O(n) - hash map storage
+
+**How it works**
+1. For each number, calculate what would sum to target (complement)
+2. Check if complement already seen in hash map
+3. If yes, return both indices
+4. If no, store current number for future lookups
+
+**Why this is better than brute force**
+- Brute force: O(n²) checking all pairs
+- Hash map: O(n) single pass with O(1) lookups
+```
+
+---
+
+### Сравнение с Summary Pipeline
+
+| Аспект | Ask Service | Summary Service |
+|--------|-------------|-----------------|
+| **Триггер** | Пользователь (кнопка/hotkey) | Автоматический (каждые 5 turns) |
+| **Ввод** | Текст + Скриншот | Только история разговора |
+| **Max Tokens** | 2048 | 1024 |
+| **Формат** | Мультимодальный | Текстовый |
+| **Fallback** | Да (retry без image) | Нет |
+| **Цель** | Ответ на конкретный вопрос | Анализ разговора |
+| **UI** | Отдельное окно Ask | Sidebar в главном окне |
+
+---
+
+### Обработка edge cases
+
+#### Case 1: Screenshot недоступен
+```javascript
+if (!screenshotResult.success) {
+    console.warn('Screenshot unavailable, sending text-only request');
+    // Продолжить без изображения
+    messages[1].content = `User Request: ${userPrompt.trim()}`;
+}
+```
+
+#### Case 2: Модель не поддерживает vision
+```javascript
+if (!modelInfo.supportsVision && screenshotBase64) {
+    console.log('Model does not support vision, excluding screenshot');
+    // Текстовый запрос
+}
+```
+
+#### Case 3: Пустой prompt от пользователя
+```javascript
+if (!userPrompt || userPrompt.trim().length === 0) {
+    return {
+        error: 'Please enter a question or request'
+    };
+}
+```
+
+#### Case 4: Нет активной сессии
+```javascript
+if (!this.currentSessionId) {
+    console.warn('No active session, creating temporary session');
+    this.currentSessionId = `temp-${Date.now()}`;
+}
+```
+
+---
+
+### Параметры конфигурации
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| **Trigger** | User action | Кнопка или Cmd/Ctrl+Shift+K |
+| **Temperature** | 0.7 | Баланс креативности и точности |
+| **Max Tokens** | 2048 | Позволяет детальные ответы |
+| **Screenshot Quality** | medium | 75% JPEG качество |
+| **Prompt Profile** | pickle_glass_analysis | 6-уровневая система |
+| **Multimodal** | true | Текст + изображение |
+| **Fallback** | true | Retry без image если нужно |
+
+---
+
+### Оптимизация производительности
+
+**Screenshot compression**:
+- JPEG формат (меньше чем PNG)
+- Настраиваемое качество (low/medium/high)
+- Кэширование для follow-up вопросов
+
+**Token optimization**:
+- История ограничена последними N сообщениями
+- Скриншот отправляется только если релевантен
+- Возможность отключить скриншот через UI
+
+**Streaming**:
+- Немедленный feedback пользователю
+- Частичные ответы показываются сразу
+- Не ждет полного ответа
+
+---
