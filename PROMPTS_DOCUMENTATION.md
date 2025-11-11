@@ -1186,3 +1186,443 @@ CREATE TABLE prompt_presets (
 ```
 
 ---
+
+## Служебные промпты
+
+Это специализированные промпты, используемые внутренними сервисами приложения для автоматической обработки разговоров, транскрипции и анализа.
+
+### 1. SUMMARY SERVICE - Автоматический анализ разговора
+
+**Назначение**: Автоматически анализирует разговор каждые 5 оборотов и предоставляет структурированную сводку с insights и follow-up вопросами.
+
+**Где используется**: `src/features/listen/summary/summaryService.js` (строки 93-134)
+
+**Триггер**: Автоматически каждые 5 оборотов разговора
+
+**Параметры AI**:
+- Модель: Текущая выбранная LLM (OpenAI/Anthropic/Gemini/Ollama)
+- Temperature: 0.7
+- Max Tokens: 1024
+
+**Базовый промпт**: Использует `pickle_glass_analysis` профиль
+
+**Структура запроса**:
+
+```javascript
+const messages = [
+    {
+        role: 'system',
+        content: systemPrompt // pickle_glass_analysis + история разговора
+    },
+    {
+        role: 'user',
+        content: `${contextualPrompt}
+
+Analyze the conversation and provide a structured summary. Format your response as follows:
+
+**Summary Overview**
+- Main discussion point with context
+
+**Key Topic: [Topic Name]**
+- First key insight
+- Second key insight
+- Third key insight
+
+**Extended Explanation**
+Provide 2-3 sentences explaining the context and implications.
+
+**Suggested Questions**
+1. First follow-up question?
+2. Second follow-up question?
+3. Third follow-up question?
+
+Keep all points concise and build upon previous analysis if provided.`
+    }
+];
+```
+
+**Формат ответа**:
+```
+**Summary Overview**
+- Основная точка обсуждения с контекстом
+
+**Key Topic: [Название темы]**
+- Первый ключевой insight
+- Второй ключевой insight
+- Третий ключевой insight
+
+**Extended Explanation**
+2-3 предложения объясняющие контекст и последствия.
+
+**Suggested Questions**
+1. Первый follow-up вопрос?
+2. Второй follow-up вопрос?
+3. Третий follow-up вопрос?
+```
+
+**История разговора**:
+- Включается последняя история разговора
+- Инжектится в системный промпт через `{{CONVERSATION_HISTORY}}`
+- Формат: `Speaker: Text\n`
+
+**Пример работы**:
+```
+[После 5 оборотов разговора о миграции на Kubernetes]
+
+**Summary Overview**
+- Discussion of successful Kubernetes migration reducing deployment time by 70%
+
+**Key Topic: Infrastructure Modernization**
+- Team of 5 engineers completed migration
+- Deployment time improved from ~20 minutes to ~6 minutes
+- Migration strategy included phased rollout to minimize risk
+
+**Extended Explanation**
+The migration demonstrates strong technical leadership and quantifiable results.
+The 70% improvement in deployment time suggests significant process optimization
+beyond just technology adoption.
+
+**Suggested Questions**
+1. What specific challenges did you face during the migration?
+2. How did you train your team on Kubernetes?
+3. What metrics beyond deployment time improved?
+```
+
+---
+
+### 2. ASK SERVICE - Мультимодальный запрос пользователя
+
+**Назначение**: Обрабатывает явные запросы пользователя через кнопку Ask. Комбинирует текст запроса со скриншотом экрана для мультимодального анализа.
+
+**Где используется**: `src/features/ask/askService.js` (строки 257-274)
+
+**Триггер**: Когда пользователь нажимает кнопку Ask или использует hotkey
+
+**Параметры AI**:
+- Модель: Текущая выбранная LLM (должна поддерживать vision)
+- Temperature: 0.7
+- Max Tokens: 2048
+- Мультимодальный: Да (текст + изображение)
+
+**Базовый промпт**: Использует `pickle_glass_analysis` профиль
+
+**Структура запроса**:
+
+```javascript
+const messages = [
+    {
+        role: 'system',
+        content: systemPrompt // pickle_glass_analysis + история разговора
+    },
+    {
+        role: 'user',
+        content: [
+            {
+                type: 'text',
+                text: `User Request: ${userPrompt.trim()}`
+            },
+            {
+                type: 'image_url',
+                image_url: {
+                    url: `data:image/jpeg;base64,${screenshotBase64}`
+                }
+            }
+        ]
+    }
+];
+```
+
+**Особенности**:
+
+1. **Захват скриншота**:
+   - Качество: medium
+   - Формат: JPEG
+   - Кодирование: base64
+
+2. **Fallback механизм**:
+   - Если мультимодальный запрос не удается
+   - Повторная попытка без изображения
+   - Только текстовый запрос
+
+3. **История разговора**:
+   - Форматируется и включается в системный промпт
+   - Предоставляет контекст для ответа
+
+**Пример работы**:
+```
+[Пользователь видит на экране LeetCode задачу "Two Sum" и нажимает Ask]
+
+User Request: "Help me solve this problem"
+
+Ассистент видит:
+1. Текст запроса: "Help me solve this problem"
+2. Скриншот с задачей Two Sum
+3. История разговора (если есть)
+
+Ответ:
+**Two Sum Solution**
+
+Here's a hash map approach with O(n) time complexity:
+
+python
+def twoSum(nums, target):
+    # Hash map to store value -> index
+    seen = {}
+
+    for i, num in enumerate(nums):
+        complement = target - num
+
+        # Check if complement exists in hash map
+        if complement in seen:
+            return [seen[complement], i]
+
+        # Store current number and its index
+        seen[num] = i
+
+    return []  # No solution found
+
+
+**Complexity Analysis**
+- Time: O(n) - single pass through array
+- Space: O(n) - hash map storage
+
+**How it works**
+- For each number, calculate what value would sum to target
+- Check if that complement already seen
+- If yes, return both indices
+- If no, store current number for future lookups
+```
+
+---
+
+### 3. STT (SPEECH-TO-TEXT) - Конфигурация транскрипции
+
+**Назначение**: Настройка параметров транскрипции речи в текст для различных AI провайдеров.
+
+**Где используется**:
+- `src/features/listen/stt/sttService.js`
+- `src/features/common/ai/providers/openai.js` (строки 69-88)
+
+**Поддерживаемые провайдеры**:
+
+#### OpenAI Realtime API
+
+**Модель**: gpt-4o-mini-transcribe
+
+**Конфигурация**:
+
+```javascript
+{
+    type: 'transcription_session.update',
+    session: {
+        input_audio_format: 'pcm16',
+        input_audio_transcription: {
+            model: 'gpt-4o-mini-transcribe',
+            prompt: config.prompt || '',  // Опциональный кастомный промпт
+            language: language || 'en'
+        },
+        turn_detection: {
+            type: 'server_vad',      // Voice Activity Detection
+            threshold: 0.5,          // Порог обнаружения речи
+            prefix_padding_ms: 200,  // Мс до начала речи
+            silence_duration_ms: 100 // Мс тишины для конца фразы
+        },
+        input_audio_noise_reduction: {
+            type: 'near_field'       // Шумоподавление для близкого микрофона
+        }
+    }
+}
+```
+
+**Параметры**:
+- `prompt`: Опциональный промпт для улучшения точности транскрипции
+  - Может содержать специфичную терминологию
+  - Помогает с именами собственными
+  - Контекст для лучшего распознавания
+- `language`: Язык транскрипции (по умолчанию 'en')
+- `threshold`: Чувствительность определения речи (0.0 - 1.0)
+- `prefix_padding_ms`: Захватывает звук до обнаружения речи
+- `silence_duration_ms`: Длительность тишины для определения конца фразы
+
+**Пример кастомного промпта**:
+```javascript
+// Для технического интервью
+prompt: "Technical interview discussing Kubernetes, Docker, AWS, microservices,
+         and cloud infrastructure. Speaker names: Sarah (interviewer), John (candidate)."
+
+// Для медицинского разговора
+prompt: "Medical consultation discussing patient symptoms, medications like
+         Metformin and Lisinopril, and medical procedures."
+```
+
+---
+
+#### Google Gemini Live
+
+**Модель**: gemini-2.5-flash
+
+**Особенности**:
+- Встроенная поддержка потоковой транскрипции
+- Автоматическое определение языка
+- Интеграция с Gemini multimodal
+
+---
+
+#### Deepgram
+
+**Модель**: nova-3
+
+**Особенности**:
+- Специализированный STT сервис
+- Высокая точность
+- Низкая латентность
+- Поддержка множества языков
+
+---
+
+#### Whisper (Локальный)
+
+**Модели**:
+- Tiny (самая быстрая, наименее точная)
+- Base
+- Small
+- Medium (наиболее точная, медленная)
+
+**Особенности**:
+- Полностью локальная транскрипция
+- Не требует API ключей
+- Работает офлайн
+- Переменная точность в зависимости от модели
+
+---
+
+### 4. PROMPT BUILDER - Система построения промптов
+
+**Назначение**: Утилита для построения финальных системных промптов из компонентов.
+
+**Где используется**: `src/features/common/prompts/promptBuilder.js`
+
+**Функция**: `buildSystemPrompt(promptParts, customPrompt, googleSearchEnabled)`
+
+**Структура сборки**:
+
+```javascript
+function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled = true) {
+    const sections = [
+        promptParts.intro,                      // 1. Введение (кто ты)
+        '\n\n',
+        promptParts.formatRequirements,         // 2. Требования к формату
+    ];
+
+    if (googleSearchEnabled) {
+        sections.push('\n\n', promptParts.searchUsage);  // 3. Использование поиска (опц.)
+    }
+
+    sections.push(
+        '\n\n',
+        promptParts.content,                    // 4. Основное содержание
+        '\n\nUser-provided context\n-----\n',
+        customPrompt,                           // 5. Кастомный промпт пользователя
+        '\n-----\n\n',
+        promptParts.outputInstructions          // 6. Инструкции по выводу
+    );
+
+    return sections.join('');
+}
+```
+
+**Компоненты промпта**:
+
+1. **intro** - Введение и идентичность AI
+   - Кто ты (роль)
+   - Кем создан
+   - Основное назначение
+
+2. **formatRequirements** - Требования к формату ответа
+   - Структура ответа
+   - Ограничения по длине
+   - Стиль форматирования
+
+3. **searchUsage** (опционально) - Когда использовать поиск
+   - Триггеры для поиска Google
+   - Типы информации для поиска
+   - Как использовать результаты
+
+4. **content** - Основное содержание промпта
+   - Детальные инструкции
+   - Примеры
+   - Правила поведения
+
+5. **customPrompt** - Пользовательский контекст
+   - Инжектится между разделителями `-----`
+   - Приоритет над общими инструкциями
+   - Может содержать:
+     - Информацию о компании
+     - Специфичные скрипты
+     - Обработку возражений
+     - История проектов
+
+6. **outputInstructions** - Финальные инструкции
+   - Формат вывода
+   - Финальные напоминания
+   - Ссылка на историю разговора (для analysis)
+
+**Пример использования**:
+
+```javascript
+const { getSystemPrompt } = require('./promptBuilder');
+
+// Базовый промпт без кастомизации
+const basicPrompt = getSystemPrompt('sales', '', true);
+
+// С кастомным контекстом пользователя
+const customContext = `
+Company: TechCorp Inc.
+Product: Cloud Analytics Platform
+Key Value Props:
+- 70% faster than competitors
+- $200K avg annual savings
+- 48-hour implementation
+
+Common Objections:
+- Price → Focus on ROI and 6-month payback
+- Competitor → Highlight speed and support
+`;
+
+const customizedPrompt = getSystemPrompt('sales', customContext, true);
+```
+
+**Google Search Integration**:
+- Если `googleSearchEnabled = true`, добавляется секция `searchUsage`
+- Промпт инструктирует AI когда использовать поиск
+- Релевантно для Sales, Meeting, Presentation, Negotiation профилей
+
+---
+
+### Сводка всех промптов приложения
+
+**Профили (Profile Prompts)** - 7 штук:
+1. Interview - базовый анализ разговора
+2. Pickle Glass - 4-уровневая иерархия решений
+3. **Pickle Glass Analysis** - главный 6-уровневый мультимодальный ассистент ⭐
+4. Sales - помощь в продажах
+5. Meeting - помощь на встречах
+6. Presentation - коуч для презентаций
+7. Negotiation - помощь в переговорах
+
+**Пресеты по умолчанию (Default Presets)** - 5 штук:
+1. School - для студентов
+2. Meetings - для встреч
+3. Sales - для продаж
+4. Recruiting - для рекрутинга
+5. Customer Support - для поддержки
+
+**Служебные промпты (Service Prompts)**:
+1. Summary Service - автоанализ каждые 5 оборотов
+2. Ask Service - мультимодальные запросы пользователя
+3. STT Configuration - настройка транскрипции
+
+**Утилиты**:
+1. Prompt Builder - система сборки промптов из компонентов
+
+---
