@@ -876,3 +876,313 @@ something is requested, give a complete list from context).
 **Примечание**: Это упрощенная версия для документации. Полная версия промпта с всеми деталями находится в `src/features/common/prompts/promptTemplates.js` (строки 238-403) и содержит ~165 строк детальных инструкций.
 
 ---
+
+## Пресеты по умолчанию
+
+Это пресеты, которые автоматически создаются в базе данных при первом запуске приложения. Они предоставляют готовые промпты для различных сценариев использования, которые пользователи могут выбрать в интерфейсе.
+
+**Где используется**: `src/features/common/services/sqliteClient.js` (строки 223-229)
+
+**Как используются**:
+- Создаются автоматически при инициализации БД
+- Сохраняются в таблице `prompt_presets`
+- Помечены как `is_default = 1` (нельзя редактировать через UI)
+- Пользователи могут дублировать их для создания кастомных версий
+- Доступны для выбора в веб-интерфейсе (`/pickleglass_web/app/personalize/page.tsx`)
+
+---
+
+### 1. SCHOOL - Ассистент для учебы
+
+**ID пресета**: `school`
+**Название**: School
+**Категория**: Образование
+
+**Назначение**: Помогает студентам понимать академический материал и отвечать на вопросы во время лекций или самостоятельного обучения.
+
+**Ключевые возможности**:
+- Прямые пошаговые ответы на вопросы
+- Показ всех необходимых рассуждений и вычислений
+- Объяснение ключевых концепций во время лекций
+- Разъяснение определений по мере их появления
+
+**Случаи использования**:
+- Просмотр онлайн-лекций
+- Решение домашних заданий
+- Подготовка к экзаменам
+- Изучение нового материала
+- Ответы на вопросы с экзаменов/тестов
+
+**Полный промт**:
+
+```text
+You are a school and lecture assistant. Your goal is to help the user, a student,
+understand academic material and answer questions.
+
+Whenever a question appears on the user's screen or is asked aloud, you provide a
+direct, step-by-step answer, showing all necessary reasoning or calculations.
+
+If the user is watching a lecture or working through new material, you offer concise
+explanations of key concepts and clarify definitions as they come up.
+```
+
+**Пример работы**:
+```
+[На экране появляется вопрос: "Solve for x: 2x + 5 = 13"]
+
+Ассистент ответит:
+**Solving for x**
+
+Step 1: Subtract 5 from both sides
+2x + 5 - 5 = 13 - 5
+2x = 8
+
+Step 2: Divide both sides by 2
+2x / 2 = 8 / 2
+x = 4
+
+**Answer: x = 4**
+```
+
+---
+
+### 2. MEETINGS - Ассистент для встреч
+
+**ID пресета**: `meetings`
+**Название**: Meetings
+**Категория**: Бизнес
+
+**Назначение**: Помогает фиксировать ключевую информацию во время встреч и эффективно следовать плану действий.
+
+**Ключевые возможности**:
+- Захват заметок с встречи
+- Отслеживание action items (задач к выполнению)
+- Идентификация ключевых решений
+- Суммирование важных обсуждаемых моментов
+
+**Случаи использования**:
+- Командные встречи
+- Один-на-один с менеджером
+- Планирование проектов
+- Статус-митинги
+- Ретроспективы
+
+**Полный промт**:
+
+```text
+You are a meeting assistant. Your goal is to help the user capture key information
+during meetings and follow up effectively.
+
+You help capture meeting notes, track action items, identify key decisions, and
+summarize important points discussed during meetings.
+```
+
+**Пример работы**:
+```
+[Во время встречи обсуждается:]
+"Okay, so Sarah will handle the client presentation by Friday, and Mike needs
+to review the budget before we proceed."
+
+Ассистент зафиксирует:
+**Action Items Identified:**
+- Sarah: Prepare and deliver client presentation (Due: Friday)
+- Mike: Review budget before proceeding
+
+**Decision:** Budget review required before next phase
+```
+
+---
+
+### 3. SALES - Ассистент для продаж в реальном времени
+
+**ID пресета**: `sales`
+**Название**: Sales
+**Категория**: Бизнес / Продажи
+
+**Назначение**: AI-ассистент для продаж в реальном времени. Помогает закрывать сделки во время взаимодействий с клиентами.
+
+**Ключевые возможности**:
+- Поддержка продаж в реальном времени
+- Предложение ответов на возражения
+- Помощь в идентификации потребностей клиента
+- Рекомендации стратегий для продвижения сделок
+
+**Случаи использования**:
+- Звонки потенциальным клиентам
+- Демонстрации продукта
+- Обсуждение условий сделки
+- Преодоление возражений
+- Переговоры о цене
+
+**Полный промт**:
+
+```text
+You are a real-time AI sales assistant, and your goal is to help the user close
+deals during sales interactions.
+
+You provide real-time sales support, suggest responses to objections, help identify
+customer needs, and recommend strategies to advance deals.
+```
+
+**Пример работы**:
+```
+[Клиент говорит: "This seems expensive compared to what we're paying now."]
+
+Ассистент предложит:
+**Handling Price Objection:**
+
+"I understand cost is a key consideration. Let's look at the ROI: our clients
+typically see a 30% reduction in operational costs within 6 months, which more
+than offsets the initial investment. Would it help if we broke down the exact
+cost savings for your specific use case?"
+
+**Next Steps:**
+- Offer ROI calculator
+- Reference similar client success stories
+- Explore payment terms flexibility
+```
+
+---
+
+### 4. RECRUITING - Ассистент для рекрутинга
+
+**ID пресета**: `recruiting`
+**Название**: Recruiting
+**Категория**: HR / Рекрутинг
+
+**Назначение**: Помогает проводить интервью с кандидатами и эффективно оценивать таланты.
+
+**Ключевые возможности**:
+- Оценка кандидатов
+- Предложение вопросов для интервью
+- Анализ ответов кандидатов
+- Предоставление insights о соответствии кандидата позиции
+
+**Случаи использования**:
+- Технические интервью
+- Поведенческие интервью
+- Скрининг кандидатов
+- Оценка культурного соответствия
+- Структурированные интервью
+
+**Полный промт**:
+
+```text
+You are a recruiting assistant. Your goal is to help the user interview candidates
+and evaluate talent effectively.
+
+You help evaluate candidates, suggest interview questions, analyze responses, and
+provide insights about candidate fit for positions.
+```
+
+**Пример работы**:
+```
+[Кандидат отвечает: "In my last role, I led a team of 5 engineers to migrate our
+entire infrastructure to Kubernetes, reducing deployment time by 70%."]
+
+Ассистент предложит:
+**Follow-up Questions to Assess Leadership & Technical Depth:**
+
+1. "What were the biggest challenges you faced during the migration, and how did
+   you help your team overcome them?"
+2. "How did you measure the 70% improvement in deployment time?"
+3. "What would you do differently if you were to lead a similar migration today?"
+
+**Evaluation Notes:**
+- Strong quantitative results (70% improvement)
+- Team leadership experience (5 engineers)
+- Modern tech stack knowledge (Kubernetes)
+- Consider probing: decision-making process, conflict resolution, technical trade-offs
+```
+
+---
+
+### 5. CUSTOMER SUPPORT - Ассистент для поддержки клиентов
+
+**ID пресета**: `customer-support`
+**Название**: Customer Support
+**Категория**: Сервис / Поддержка
+
+**Назначение**: Помогает эффективно и тщательно решать проблемы клиентов.
+
+**Ключевые возможности**:
+- Диагностика проблем клиентов
+- Предложение решений
+- Пошаговое руководство по устранению неполадок
+- Обеспечение удовлетворенности клиентов
+
+**Случаи использования**:
+- Техническая поддержка
+- Обработка жалоб
+- Устранение неполадок продукта
+- Onboarding новых клиентов
+- Эскалация проблем
+
+**Полный промт**:
+
+```text
+You are a customer support assistant. Your goal is to help resolve customer issues
+efficiently and thoroughly.
+
+You help diagnose customer problems, suggest solutions, provide step-by-step
+troubleshooting guidance, and ensure customer satisfaction.
+```
+
+**Пример работы**:
+```
+[Клиент говорит: "The app keeps crashing when I try to upload files larger than 10MB."]
+
+Ассистент предложит:
+**Issue Diagnosed: File Upload Crashes (>10MB)**
+
+**Immediate Troubleshooting Steps:**
+
+1. "Can you confirm which browser you're using? Some browsers have upload size
+   limitations that we can work around."
+
+2. "In the meantime, try compressing the file or uploading via our desktop app,
+   which handles larger files better."
+
+3. "I'm also going to escalate this to our engineering team to investigate the
+   browser upload limit."
+
+**Follow-up Actions:**
+- Confirm browser version
+- Test with compressed file
+- Provide desktop app link
+- Create ticket for engineering team
+- Set expectation for resolution timeline (24-48 hours)
+```
+
+---
+
+### Управление пресетами
+
+**Веб-интерфейс**: `/pickleglass_web/app/personalize/page.tsx`
+
+**Возможности**:
+- Просмотр всех пресетов (default + custom)
+- Создание новых custom пресетов
+- Дублирование существующих пресетов
+- Редактирование custom пресетов
+- Удаление custom пресетов
+- Реальное время сохранения в БД
+
+**Ограничения**:
+- Default пресеты (is_default=1) - только для чтения
+- Можно дублировать default пресет для создания редактируемой копии
+- Custom пресеты (is_default=0) можно полностью редактировать
+
+**База данных**:
+```sql
+CREATE TABLE prompt_presets (
+    id TEXT PRIMARY KEY,
+    uid TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    is_default INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+)
+```
+
+---
