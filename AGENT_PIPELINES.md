@@ -1079,3 +1079,654 @@ if (!this.currentSessionId) {
 - Не ждет полного ответа
 
 ---
+
+## 3. STT Transcription Pipeline
+
+**Назначение**: Транскрипция речи в текст в реальном времени. Поддерживает два отдельных аудио потока: микрофон пользователя (my) и системный звук собеседника (their).
+
+**Триггер**: Пользователь начинает сессию Listen или активирует транскрипцию
+
+**Где реализован**: `src/features/listen/stt/sttService.js`
+
+---
+
+### ASCII Диаграмма потока
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    STT TRANSCRIPTION PIPELINE                        │
+│          (Dual Stream: Microphone + System Audio)                    │
+└─────────────────────────────────────────────────────────────────────┘
+
+[User Starts Session]
+     │
+     │ Start transcription
+     │
+┌────▼─────────────────────────────────┐
+│   Get STT Model Configuration        │
+│   modelStateService                  │
+│   .getCurrentModelInfo('stt')        │
+└────┬─────────────────────────────────┘
+     │
+     │ STT config (provider, model, apiKey)
+     │
+     ├──────────────────────────────────┬───────────────────────────────┐
+     │                                  │                               │
+     │ Create "my" session              │ Create "their" session        │
+     │ (user microphone)                │ (system audio)                │
+     │                                  │                               │
+┌────▼─────────────────────────┐  ┌────▼────────────────────────┐     │
+│  Create STT Session (my)     │  │  Create STT Session (their)  │     │
+│  - Provider: OpenAI/Gemini/  │  │  - Provider: OpenAI/Gemini/  │     │
+│    Deepgram/Whisper          │  │    Deepgram/Whisper          │     │
+│  - Language: en              │  │  - Language: en              │     │
+│  - Custom prompt (optional)  │  │  - Custom prompt (optional)  │     │
+└────┬─────────────────────────┘  └────┬────────────────────────┘     │
+     │                                  │                               │
+     │ STT session created              │ STT session created           │
+     │                                  │                               │
+┌────▼─────────────────────────┐  ┌────▼────────────────────────┐     │
+│  Start Keep-Alive Timer      │  │  Start Session Renewal       │     │
+│  Interval: 60 seconds        │  │  Timer: 20 minutes           │     │
+│  → Send empty audio packets  │  │  → Recreate sessions         │     │
+│    to prevent timeout        │  │    before 30min limit        │     │
+└────┬─────────────────────────┘  └─────────────────────────────┘     │
+     │                                                                  │
+     │◄─────────────────────────────────────────────────────────────────┘
+     │
+┌────▼──────────────────────────────────────────────────────────┐
+│   Start Audio Capture                                         │
+│   - Microphone → "my" STT session                             │
+│   - System Audio (via BlackHole/etc) → "their" STT session    │
+└────┬──────────────────────────────────────────────────────────┘
+     │
+     │ Continuous audio streams
+     │
+     ├─────────────────────────┬─────────────────────────────────┐
+     │                         │                                 │
+     │ User speaking           │ Other person speaking           │
+     │ (microphone)            │ (system audio)                  │
+     │                         │                                 │
+┌────▼──────────────────┐  ┌───▼──────────────────────┐         │
+│  Process "my" Audio   │  │  Process "their" Audio    │         │
+│  - Send to my STT     │  │  - Send to their STT      │         │
+│  - Receive partial    │  │  - Receive partial        │         │
+│    transcripts        │  │    transcripts            │         │
+└────┬──────────────────┘  └───┬──────────────────────┘         │
+     │                         │                                 │
+     │ Partial transcript      │ Partial transcript              │
+     │                         │                                 │
+┌────▼──────────────────┐  ┌───▼──────────────────────┐         │
+│  Update UI (my)       │  │  Update UI (their)        │         │
+│  - Show live text     │  │  - Show live text         │         │
+│  - "me: [typing...]"  │  │  - "them: [typing...]"    │         │
+└────┬──────────────────┘  └───┬──────────────────────┘         │
+     │                         │                                 │
+     │ Silence detected        │ Silence detected                │
+     │ (VAD - Voice Activity   │ (VAD - Voice Activity           │
+     │  Detection)             │  Detection)                     │
+     │                         │                                 │
+┌────▼──────────────────┐  ┌───▼──────────────────────┐         │
+│  Debounce Timer       │  │  Debounce Timer           │         │
+│  Wait 2 seconds       │  │  Wait 2 seconds           │         │
+│  for silence          │  │  for silence              │         │
+└────┬──────────────────┘  └───┬──────────────────────┘         │
+     │                         │                                 │
+     │ Timer expires           │ Timer expires                   │
+     │ (utterance complete)    │ (utterance complete)            │
+     │                         │                                 │
+┌────▼──────────────────┐  ┌───▼──────────────────────┐         │
+│  Finalize Transcript  │  │  Finalize Transcript      │         │
+│  myCompletionBuffer   │  │  theirCompletionBuffer    │         │
+└────┬──────────────────┘  └───┬──────────────────────┘         │
+     │                         │                                 │
+     │◄────────────────────────┘                                 │
+     │                                                            │
+     │ Both finalized                                            │
+     │                                                            │
+┌────▼──────────────────────────────────────────────────────────┐
+│   Save to Database (conversationRepository)                   │
+│   {                                                            │
+│     session_id,                                                │
+│     speaker: 'me' or 'them',                                   │
+│     text: finalizedTranscript,                                 │
+│     timestamp                                                  │
+│   }                                                            │
+└────┬───────────────────────────────────────────────────────────┘
+     │
+     │ Saved
+     │
+┌────▼───────────────────────────────────────────────────────────┐
+│   Trigger Callback: onTranscriptionComplete                    │
+│   → Increment turn counter                                     │
+│   → Potentially trigger Summary Analysis (if turn >= 5)        │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Детальное описание компонентов
+
+#### 1. Dual Stream Architecture
+
+**Два независимых STT потока**:
+
+1. **"my" Stream** - Микрофон пользователя
+   - Захватывает речь пользователя
+   - Speaker: `me`
+   - Аудио источник: Default microphone
+
+2. **"their" Stream** - Системный звук
+   - Захватывает речь собеседника из системного аудио
+   - Speaker: `them`
+   - Аудио источник: BlackHole (macOS) / Virtual Audio Cable (Windows)
+
+```javascript
+constructor() {
+    this.mySttSession = null;        // User microphone STT
+    this.theirSttSession = null;     // System audio STT
+    this.myCurrentUtterance = '';    // Current partial transcript (my)
+    this.theirCurrentUtterance = ''; // Current partial transcript (their)
+}
+```
+
+---
+
+#### 2. STT Provider Support
+
+**OpenAI Realtime API**:
+```javascript
+// Конфигурация в providers/openai.js
+{
+    type: 'transcription_session.update',
+    session: {
+        input_audio_format: 'pcm16',
+        input_audio_transcription: {
+            model: 'gpt-4o-mini-transcribe',
+            prompt: customPrompt,    // Опционально
+            language: 'en'
+        },
+        turn_detection: {
+            type: 'server_vad',      // Voice Activity Detection
+            threshold: 0.5,
+            prefix_padding_ms: 200,
+            silence_duration_ms: 100
+        }
+    }
+}
+```
+
+**Google Gemini Live**:
+```javascript
+// Встроенная STT с мультимодальностью
+{
+    model: 'gemini-2.5-flash',
+    config: {
+        audioTranscription: true,
+        language: 'en-US'
+    }
+}
+```
+
+**Deepgram**:
+```javascript
+// Специализированный STT сервис
+{
+    model: 'nova-3',
+    encoding: 'linear16',
+    sample_rate: 16000,
+    channels: 1,
+    language: 'en'
+}
+```
+
+**Whisper (локальный)**:
+```javascript
+// Запускается как subprocess
+const whisperProcess = spawn('whisper', [
+    '--model', 'medium',  // tiny/base/small/medium
+    '--language', 'en',
+    '--output_format', 'json',
+    '--'  // stdin
+]);
+```
+
+---
+
+#### 3. Keep-Alive & Session Renewal
+
+**Проблема**: Многие STT провайдеры закрывают соединение после периода бездействия или имеют жесткий лимит времени сессии (30 минут).
+
+**Решение**:
+
+**Keep-Alive Timer** (60 секунд):
+```javascript
+this.keepAliveInterval = setInterval(() => {
+    // Отправка пустого аудио пакета для поддержания соединения
+    if (this.mySttSession) {
+        this.mySttSession.sendKeepAlive();
+    }
+    if (this.theirSttSession) {
+        this.theirSttSession.sendKeepAlive();
+    }
+}, KEEP_ALIVE_INTERVAL_MS); // 60 seconds
+```
+
+**Session Renewal Timer** (20 минут):
+```javascript
+this.sessionRenewTimeout = setTimeout(async () => {
+    console.log('Renewing STT sessions to avoid 30min timeout...');
+
+    // Создать новые сессии
+    const newMySttSession = await createSTT(this.modelInfo);
+    const newTheirSttSession = await createSTT(this.modelInfo);
+
+    // 2-секундное перекрытие для плавного перехода
+    setTimeout(() => {
+        // Закрыть старые сессии
+        this.mySttSession.close();
+        this.theirSttSession.close();
+
+        // Переключиться на новые
+        this.mySttSession = newMySttSession;
+        this.theirSttSession = newTheirSttSession;
+    }, SOCKET_OVERLAP_MS);
+
+    // Рекурсивно установить следующее обновление
+    this.startSessionRenewal();
+}, SESSION_RENEW_INTERVAL_MS); // 20 minutes
+```
+
+---
+
+#### 4. Voice Activity Detection (VAD)
+
+**Server-side VAD** (OpenAI):
+- Провайдер определяет начало и конец речи
+- Автоматически отправляет события `speech_started`, `speech_stopped`
+- Не требует клиентской логики
+
+**Client-side VAD** (Whisper/Deepgram):
+```javascript
+function detectSpeech(audioBuffer) {
+    const volume = calculateRMS(audioBuffer);
+    const threshold = 0.01; // Настраиваемый порог
+
+    if (volume > threshold) {
+        return 'speaking';
+    } else {
+        return 'silence';
+    }
+}
+```
+
+---
+
+#### 5. Debouncing & Turn Completion
+
+**Проблема**: Частые паузы в речи могут привести к преждевременному завершению utterance.
+
+**Решение**: Debounce timer на 2 секунды
+
+```javascript
+handlePartialTranscript(speaker, text) {
+    if (speaker === 'me') {
+        this.myCompletionBuffer = text;
+
+        // Clear existing timer
+        clearTimeout(this.myCompletionTimer);
+
+        // Set new 2-second timer
+        this.myCompletionTimer = setTimeout(() => {
+            this.finalizeTranscript('me', this.myCompletionBuffer);
+        }, COMPLETION_DEBOUNCE_MS); // 2000ms
+    } else {
+        // Same for "their"
+        this.theirCompletionBuffer = text;
+        clearTimeout(this.theirCompletionTimer);
+        this.theirCompletionTimer = setTimeout(() => {
+            this.finalizeTranscript('them', this.theirCompletionBuffer);
+        }, COMPLETION_DEBOUNCE_MS);
+    }
+}
+```
+
+**Результат**:
+- Паузы < 2 секунд: продолжение того же utterance
+- Паузы >= 2 секунд: завершение utterance, сохранение в БД
+
+---
+
+#### 6. Сохранение в БД
+
+```javascript
+async finalizeTranscript(speaker, text) {
+    if (!text || text.trim().length === 0) {
+        return; // Игнорировать пустые транскрипты
+    }
+
+    // Сохранить в БД
+    await conversationRepository.create({
+        session_id: this.currentSessionId,
+        speaker: speaker,  // 'me' или 'them'
+        text: text.trim(),
+        timestamp: Date.now()
+    });
+
+    // Уведомить UI
+    this.onStatusUpdate?.({
+        speaker,
+        text,
+        status: 'finalized'
+    });
+
+    // Вызвать callback для триггера Summary
+    this.onTranscriptionComplete?.({
+        speaker,
+        text
+    });
+}
+```
+
+---
+
+#### 7. System Audio Capture
+
+**macOS** (BlackHole):
+```bash
+# Установка
+brew install blackhole-2ch
+
+# Настройка в Audio MIDI Setup:
+# 1. Create Multi-Output Device
+# 2. Select: Built-in Output + BlackHole 2ch
+# 3. Set as system default output
+```
+
+**Windows** (VB-Cable):
+```powershell
+# Установка VB-Audio Virtual Cable
+# Настройка:
+# 1. Set VB-Cable as default recording device
+# 2. Configure app to output to VB-Cable
+# 3. Listen to VB-Cable output on speakers
+```
+
+**Захват в коде**:
+```javascript
+const { spawn } = require('child_process');
+
+// Запустить системный аудио захват
+this.systemAudioProc = spawn('ffmpeg', [
+    '-f', 'avfoundation',          // macOS
+    '-i', ':BlackHole 2ch',        // Input device
+    '-f', 's16le',                 // 16-bit PCM
+    '-ar', '16000',                // 16kHz sample rate
+    '-ac', '1',                    // Mono
+    '-'                            // Output to stdout
+]);
+
+// Pipe аудио в STT session
+this.systemAudioProc.stdout.on('data', (audioChunk) => {
+    this.theirSttSession.sendAudio(audioChunk);
+});
+```
+
+---
+
+### Параметры конфигурации
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| **Keep-Alive Interval** | 60 seconds | Частота keep-alive пакетов |
+| **Session Renewal** | 20 minutes | Период пересоздания сессий |
+| **Socket Overlap** | 2 seconds | Перекрытие при переключении сессий |
+| **Completion Debounce** | 2 seconds | Задержка до финализации utterance |
+| **VAD Threshold** | 0.5 | Порог определения речи (0.0-1.0) |
+| **Sample Rate** | 16kHz | Частота дискретизации аудио |
+| **Audio Format** | PCM16 | Формат аудио данных |
+
+---
+
+## 4. Conversation Flow Pipeline
+
+**Назначение**: Общий поток управления разговором, интеграция всех компонентов (STT, Summary, Ask) в единую систему.
+
+**Где реализован**: Распределено по `sttService.js`, `summaryService.js`, `askService.js`
+
+---
+
+### ASCII Диаграмма общего потока
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   COMPLETE CONVERSATION FLOW                         │
+│           (Integration of STT → Summary → Ask)                       │
+└─────────────────────────────────────────────────────────────────────┘
+
+[User Starts Session]
+     │
+     ├─────────────────────────────────┐
+     │                                 │
+     ▼                                 ▼
+┌─────────────────┐          ┌─────────────────────┐
+│  STT Pipeline   │          │  UI Initialization  │
+│  (Continuous)   │          │  - Create windows   │
+└────┬────────────┘          │  - Setup IPC        │
+     │                       └─────────────────────┘
+     │ Real-time transcription
+     │
+     ├──────────────┬──────────────┐
+     │              │              │
+     ▼              ▼              ▼
+  Speaker: me   Speaker: them   Silence
+     │              │              │
+     │              │              │
+┌────▼──────────────▼──────────────▼─────┐
+│   Partial Transcripts Display          │
+│   - Live updating in UI                │
+│   - "me: [typing...]"                  │
+│   - "them: [typing...]"                │
+└────┬───────────────────────────────────┘
+     │
+     │ 2 seconds of silence
+     │
+┌────▼───────────────────────────────────┐
+│   Finalize Utterance                   │
+│   - Save to database                   │
+│   - Mark as complete in UI             │
+└────┬───────────────────────────────────┘
+     │
+     │ Increment turn counter
+     │
+     ▼
+┌─────────────────┐
+│  Turn Counter   │
+│  turnCount++    │
+└────┬────────────┘
+     │
+     │ Check if turnCount >= 5
+     │
+     ├─────────────┬──────────────────┐
+     │             │                  │
+     │ Yes         │ No               │
+     │             │                  │
+     ▼             ▼                  │
+┌─────────────────┐                  │
+│  Summary        │      Continue    │
+│  Pipeline       │      listening   │
+│  (Auto)         │                  │
+└────┬────────────┘                  │
+     │                               │
+     │ AI Analysis                   │
+     │                               │
+┌────▼────────────────────────┐      │
+│  Display Summary            │      │
+│  - Summary Overview         │      │
+│  - Key Topics               │      │
+│  - Suggested Questions      │      │
+└────┬────────────────────────┘      │
+     │                               │
+     │◄──────────────────────────────┘
+     │
+     │ Continue conversation
+     │
+     ├────────────────────────────────┐
+     │                                │
+     │ Meanwhile...                   │
+     │                                │
+     ▼                                ▼
+[User presses Ask]         [Conversation continues]
+     │                                │
+     ▼                                │
+┌─────────────────────┐               │
+│  Ask Pipeline       │               │
+│  (On-Demand)        │               │
+└────┬────────────────┘               │
+     │                                │
+     │ Capture screenshot             │
+     │ + User prompt                  │
+     │                                │
+┌────▼────────────────────────┐       │
+│  AI Response (Multimodal)   │       │
+│  - Text + Image analysis    │       │
+└────┬────────────────────────┘       │
+     │                                │
+┌────▼────────────────────────┐       │
+│  Display in Ask Window      │       │
+│  - Formatted markdown       │       │
+│  - Code highlighting        │       │
+└─────────────────────────────┘       │
+                                      │
+                 ┌────────────────────┘
+                 │
+                 ▼
+          [Loop continues...]
+```
+
+---
+
+### Поток данных между компонентами
+
+#### 1. STT → Database → Summary
+
+```javascript
+// STT finalizes transcript
+sttService.finalizeTranscript('me', 'Hello, can you tell me about your experience?');
+    │
+    ├─> conversationRepository.create({...})
+    │       │
+    │       └─> SQLite: INSERT INTO conversation (...)
+    │
+    └─> onTranscriptionComplete callback
+            │
+            └─> summaryService.increment turnCount
+                    │
+                    └─> if (turnCount >= 5) → trigger analysis
+```
+
+#### 2. User → Ask → Response
+
+```javascript
+// User presses Ask button
+userAction: Cmd+Shift+K
+    │
+    ├─> askService.showAskDialog()
+    │       │
+    │       └─> User enters prompt
+    │               │
+    │               └─> askService.sendQuestion(prompt)
+    │                       │
+    │                       ├─> Capture screenshot
+    │                       ├─> Get conversation history
+    │                       ├─> Build multimodal prompt
+    │                       └─> Stream AI response
+    │                               │
+    │                               └─> Display in Ask window
+```
+
+#### 3. Summary → UI → User Action
+
+```javascript
+// Summary analysis complete
+summaryService.analysisComplete(response)
+    │
+    ├─> Save to conversation_analysis table
+    │
+    └─> Send to UI via IPC
+            │
+            └─> UI displays:
+                    - Summary Overview
+                    - Key Topics
+                    - Suggested Questions (clickable)
+                            │
+                            └─> User clicks question
+                                    │
+                                    └─> Auto-populate Ask dialog
+```
+
+---
+
+### Состояния сессии
+
+```javascript
+// Session State Machine
+const SessionState = {
+    IDLE: 'idle',                    // Нет активной сессии
+    INITIALIZING: 'initializing',    // Создание STT сессий
+    LISTENING: 'listening',          // Активная транскрипция
+    ANALYZING: 'analyzing',          // Summary в процессе
+    ASKING: 'asking',                // Ask запрос в процессе
+    ERROR: 'error'                   // Ошибка
+};
+
+// Transitions
+IDLE → INITIALIZING → LISTENING
+        ↓                ↓
+      ERROR          ANALYZING
+                        ↓
+                    LISTENING
+                        ↓
+                     ASKING
+                        ↓
+                    LISTENING
+```
+
+---
+
+### IPC Events (Inter-Process Communication)
+
+**Main Process → Renderer**:
+- `transcription-partial`: Частичный транскрипт
+- `transcription-complete`: Финализированный транскрипт
+- `analysis-chunk`: Частичный Summary анализ
+- `analysis-complete`: Полный Summary анализ
+- `ask-response-chunk`: Частичный Ask ответ
+- `ask-response-complete`: Полный Ask ответ
+
+**Renderer → Main Process**:
+- `start-session`: Начать новую сессию
+- `stop-session`: Остановить сессию
+- `ask-question`: Отправить Ask запрос
+- `update-model-config`: Обновить конфигурацию модели
+
+---
+
+### Оптимизация всего потока
+
+**Параллельная обработка**:
+- STT работает непрерывно
+- Summary триггерится асинхронно (не блокирует STT)
+- Ask выполняется в отдельном окне (не блокирует основной поток)
+
+**Кэширование**:
+- Системные промпты кэшируются для сессии
+- История разговора загружается инкрементально
+- Скриншоты кэшируются для follow-up Ask запросов
+
+**Дебаунсинг**:
+- STT utterance completion: 2 секунды
+- Summary не триггерится если предыдущий еще выполняется
+- Ask запросы queued если множественные
+
+---
